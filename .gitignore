@@ -1,0 +1,16 @@
+redis-offline-install_comprehensive
+redis-offline-install
+offline-packages
+goal.md
+offline-packages_copy
+results/
+*.zip
+*.tar.gz
+
+# 忽略 Python 的虛擬環境
+venv/
+
+# 忽略 Python 的快取檔案
+__pycache__/
+*.pyc
+CLAUDE.md

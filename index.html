@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<!-- lang="zh-Hant" 代表這是一個繁體中文的網頁 -->
+<html lang="zh-Hant">
+<head>
+    <!-- 宣告文件使用的字元編碼是 UTF-8，避免亂碼 -->
+    <meta charset="UTF-8" />
+    <!-- 這是響應式網頁設計的關鍵設定，讓網頁在手機和電腦上都能有好的顯示效果 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- 顯示在瀏覽器分頁標籤上的標題 -->
+    <title>AI 模型處理介面</title>
+    
+    <!-- 載入 Tailwind CSS 函式庫 -->
+    <!-- Tailwind 是一個 CSS 框架，讓我們可以用 class 的方式快速設定樣式，例如 class="text-2xl font-bold" -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- === React 核心函式庫 === -->
+    <!-- 1. 載入 React 核心 -->
+    <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin></script>
+    <!-- 2. 載入 React DOM，這是 React 用來操作網頁元素的工具 -->
+    <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+    <!-- 3. 載入 Babel -->
+    <!-- 瀏覽器本身不認識 React 的 JSX 語法 (看起來像 HTML 的語法)，Babel 的作用就是即時將 JSX 轉譯成瀏覽器看得懂的普通 JavaScript -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- 自訂的 CSS 樣式 -->
+    <style>
+        /* 設定網頁預設字體 */
+        body { font-family: 'Inter', sans-serif; }
+        /* 定義聊天氣泡的樣式 */
+        .chat-bubble {
+            max-width: 80%;
+            padding: 10px 15px;
+            border-radius: 20px;
+            word-wrap: break-word; /* 讓長單字可以自動換行 */
+        }
+        /* 使用者發送的氣泡樣式 (綠色，靠右) */
+        .chat-bubble.user {
+            background-color: #d1fae5; /* green-200 */
+            align-self: flex-end;
+        }
+        /* AI Server 回應的氣泡樣式 (灰色，靠左) */
+        .chat-bubble.bot {
+            background-color: #e5e7eb; /* gray-200 */
+            align-self: flex-start;
+        }
+    </style>
+</head>
+<body class="bg-gray-100">
+    <!-- 這個 div 是 React 應用程式的進入點。React 會把所有動態產生的網頁內容都塞進這個 div 裡面。 -->
+    <div id="root"></div>
+
+    <!-- 重要的 "type=text/babel" 告訴瀏覽器，這段 script 需要先經過 Babel 處理 -->
+    <script type="text/babel">
+        // 從 React 函式庫中取出幾個常用的工具 (Hooks)，方便後面直接使用
+        const { useState, useEffect, useRef } = React;
+
+        // --- React 元件定義 ---
+        
+        /**
+         * [新增] ConnectionStatus 元件：顯示 WebSocket 連線狀態
+         */
+        function ConnectionStatus({ isConnected }) {
+            const statusColor = isConnected ? 'bg-green-500' : 'bg-red-500';
+            const statusText = isConnected ? '連線成功' : '連線中斷';
+            return (
+                <div className="flex items-center space-x-2">
+                    <span className={`h-3 w-3 rounded-full ${statusColor} transition-colors duration-500`}></span>
+                    <span className="text-sm font-medium text-gray-300">{statusText}</span>
+                </div>
+            );
+        }
+
+        /**
+         * Message 元件：專門用來顯示一條聊天訊息
+         */
+        function Message({ message }) {
+            const isBot = message.sender === 'bot';
+            const bubbleClass = isBot ? 'bot' : 'user';
+            const alignClass = isBot ? 'justify-start' : 'justify-end';
+
+            return (
+                <div className={`flex ${alignClass} mb-4`}>
+                    <div className={`chat-bubble ${bubbleClass}`}>
+                        <div className="font-bold text-sm mb-1">{isBot ? 'AI Server' : 'You'}</div>
+                        <div>{message.text}</div>
+                        {message.imageUrl && (
+                            <div className="mt-2">
+                                <img src={message.imageUrl} alt="AI anaylsis result" className="rounded-lg max-w-full h-auto" />
+                            </div>
+                        )}
+                        {message.gdsUrl && (
+                             <a 
+                                href={message.gdsUrl} 
+                                download 
+                                className="mt-2 inline-block bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded"
+                            >
+                                下載 GDS 檔案
+                            </a>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        /**
+         * ChatWindow 元件：顯示整個聊天歷史紀錄的視窗
+         */
+        function ChatWindow({ messages }) {
+            const chatEndRef = useRef(null);
+
+            useEffect(() => {
+                chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+            }, [messages]);
+
+            return (
+                <div className="flex-1 p-6 overflow-y-auto bg-white rounded-t-lg">
+                    {messages.map((msg, index) => (
+                        <Message key={index} message={msg} />
+                    ))}
+                    <div ref={chatEndRef} />
+                </div>
+            );
+        }
+
+        /**
+         * App 元件：整個應用程式的主體
+         */
+        function App() {
+            const [messages, setMessages] = useState([
+                { sender: 'bot', text: '您好！請上傳 PDF 檔案或輸入 Rule 描述來開始任務。' }
+            ]);
+            const [inputText, setInputText] = useState('');
+            const [files, setFiles] = useState([]);
+            const [isLoading, setIsLoading] = useState(false);
+            // [新增] 用來追蹤 WebSocket 連線狀態的 state
+            const [isConnected, setIsConnected] = useState(false);
+            
+            const clientId = useRef(`client_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`);
+
+            useEffect(() => {
+                const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws/${clientId.current}`);
+                
+                ws.onopen = () => {
+                    console.log(`WebSocket 連線成功，客戶端 ID: ${clientId.current}`);
+                    setIsConnected(true); // [修改] 連線成功時更新狀態
+                };
+
+                ws.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+                    const newMessage = {
+                        sender: 'bot',
+                        text: data.message,
+                        imageUrl: data.image_url,
+                        gdsUrl: data.gds_url
+                    };
+                    setMessages(prev => [...prev, newMessage]);
+                    if (data.status === 'completed' || data.status === 'error') {
+                        setIsLoading(false);
+                    }
+                };
+                
+                ws.onerror = (error) => {
+                    console.error("WebSocket 錯誤:", error);
+                    setIsConnected(false); // [修改] 連線錯誤時更新狀態
+                    const errorMessage = {
+                        sender: 'bot',
+                        text: '與伺服器的即時連線發生錯誤，請檢查後端服務狀態並刷新頁面。'
+                    };
+                    setMessages(prev => [...prev, errorMessage]);
+                    setIsLoading(false);
+                };
+
+                // [新增] 監聽連線關閉事件
+                ws.onclose = () => {
+                    console.log("WebSocket 連線已關閉");
+                    setIsConnected(false); // 連線關閉時更新狀態
+                };
+
+                return () => {
+                    ws.close();
+                };
+            }, []);
+
+            const handleFileChange = (e) => {
+                setFiles(Array.from(e.target.files));
+            };
+
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                if (!inputText.trim() && files.length === 0) {
+                    alert('請至少輸入文字或選擇一個檔案。');
+                    return;
+                }
+                
+                setIsLoading(true);
+                
+                const userMessage = { 
+                    sender: 'user', 
+                    text: `提交任務：${inputText} (${files.length} 個檔案)` 
+                };
+                setMessages(prev => [...prev, userMessage]);
+
+                const formData = new FormData();
+                formData.append('text', inputText);
+                formData.append('client_id', clientId.current);
+                files.forEach(file => {
+                    formData.append('files', file);
+                });
+
+                try {
+                    const response = await fetch('/submit-task', {
+                        method: 'POST',
+                        body: formData,
+                    });
+                    const result = await response.json();
+                    
+                    if (response.ok) {
+                        const botMessage = {
+                            sender: 'bot',
+                            text: `任務已成功提交 (Task ID: ${result.task_id})，請稍候...`
+                        };
+                        setMessages(prev => [...prev, botMessage]);
+                    } else {
+                        throw new Error(result.detail || '提交任務失敗');
+                    }
+                } catch (error) {
+                    console.error("提交失敗:", error);
+                    const errorMessage = { sender: 'bot', text: `錯誤：${error.message}` };
+                    setMessages(prev => [...prev, errorMessage]);
+                    setIsLoading(false);
+                }
+                
+                setInputText('');
+                setFiles([]);
+                document.getElementById('file-input').value = '';
+            };
+
+            return (
+                <div className="flex flex-col h-screen max-w-4xl mx-auto bg-gray-200 shadow-2xl rounded-lg">
+                    {/* [修改] 讓 header 可以同時顯示標題和連線狀態 */}
+                    <header className="bg-gray-800 text-white p-4 flex justify-between items-center rounded-t-lg">
+                        <h1 className="text-2xl font-bold">AI 模型處理服務</h1>
+                        {/* [新增] 使用連線狀態元件 */}
+                        <ConnectionStatus isConnected={isConnected} />
+                    </header>
+                    <ChatWindow messages={messages} />
+                    <footer className="p-4 bg-white border-t border-gray-300 rounded-b-lg">
+                        <form onSubmit={handleSubmit} className="flex items-center space-x-4">
+                            <input
+                                type="text"
+                                value={inputText}
+                                onChange={(e) => setInputText(e.target.value)}
+                                placeholder="輸入 DRC Rule 描述..."
+                                className="flex-1 p-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                disabled={isLoading}
+                            />
+                            <input
+                                type="file"
+                                id="file-input"
+                                onChange={handleFileChange}
+                                multiple
+                                className="hidden"
+                            />
+                            <label htmlFor="file-input" className={`px-4 py-2 text-white font-semibold rounded-lg cursor-pointer ${isLoading ? 'bg-gray-400' : 'bg-indigo-500 hover:bg-indigo-600'}`}>
+                                {files.length > 0 ? `${files.length} 個檔案` : '選擇檔案'}
+                            </label>
+                            <button
+                                type="submit"
+                                className={`px-6 py-2 bg-blue-500 text-white font-bold rounded-lg hover:bg-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-400`}
+                                disabled={isLoading}
+                            >
+                                {isLoading ? '處理中...' : '提交'}
+                            </button>
+                        </form>
+                    </footer>
+                </div>
+            );
+        }
+
+        const container = document.getElementById('root');
+        const root = ReactDOM.createRoot(container);
+        root.render(<App />);
+    </script>
+</body>
+</html>
+
