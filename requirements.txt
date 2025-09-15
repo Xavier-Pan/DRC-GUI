@@ -4,3 +4,5 @@ python-multipart
 celery
 # [修改] 為了讓 Redis Pub/Sub 運作得更好，建議使用 hiredis
 redis[hiredis]
+# Environment variables support
+python-dotenv
