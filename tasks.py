@@ -1,10 +1,11 @@
 import time
 import os
 import json
+import zipfile
 from pathlib import Path
 import redis
 import ftplib
-from typing import Tuple
+from typing import Tuple, Dict, List
 from dotenv import load_dotenv
 
 from celery_app import celery_app
@@ -36,6 +37,19 @@ class CustomFTP_TLS(ftplib.FTP_TLS):
                                           server_hostname=self.host,
                                           session=self.sock.session)  # Reuse TLS session
         return conn, size
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            self.quit()
+        except:
+            # If quit fails, try close as fallback
+            try:
+                self.close()
+            except:
+                pass
 
 def update_progress_via_redis(client_id: str, payload: dict):
     """
@@ -69,41 +83,39 @@ def ftp_to_server_b(model_output_path: str):
     try:
         print(f"正在將 {model_output_path} FTP 到 Server B...")
         
-        ftp = CustomFTP_TLS()
-        ftp.connect(FTP_SERVER_B['host'], FTP_SERVER_B['port'])
-        ftp.auth() # 進行安全握手
-        ftp.login(FTP_SERVER_B['username'], FTP_SERVER_B['password'])
-        ftp.prot_p()  # 將資料傳輸通道也加密
-        ftp.set_pasv(True)  # 使用被動模式
-        
-        # 切換到上傳目錄
-        ftp.cwd(FTP_SERVER_B['upload_dir'])
-        
-        # 上傳檔案
-        with open(model_output_path, 'rb') as file:
-            filename = Path(model_output_path).name
-            ftp.storbinary(f'STOR {filename}', file)
-        
-        ftp.quit()
+        with CustomFTP_TLS() as ftp:
+            ftp.connect(FTP_SERVER_B['host'], FTP_SERVER_B['port'])
+            ftp.auth() # 進行安全握手
+            ftp.login(FTP_SERVER_B['username'], FTP_SERVER_B['password'])
+            ftp.prot_p()  # 將資料傳輸通道也加密
+            ftp.set_pasv(True)  # 使用被動模式
+            
+            # 切換到上傳目錄
+            ftp.cwd(FTP_SERVER_B['upload_dir'])
+            
+            # 上傳檔案
+            with open(model_output_path, 'rb') as file:
+                filename = Path(model_output_path).name
+                ftp.storbinary(f'STOR {filename}', file)
         print("FTP 傳輸完成。")
         
     except Exception as e:
         print(f"FTP 上傳失敗: {e}")
         raise
 
-def wait_for_server_b_response(client_id: str) -> Tuple[str, str]:
-    """等待並下載 Server B 回傳結果"""
-    print("等待 Server B 回傳結果...")
+def wait_for_server_b_response(task_id: str) -> Dict:
+    """等待並下載 Server B 回傳批次結果"""
+    print(f"等待 Server B 回傳批次結果... (Task ID: {task_id})")
     
-    image_file_name = f"{client_id}_result.png"
-    gds_file_name = f"{client_id}_result.gds"
+    zip_file_name = f"{task_id}_results.zip"
+    manifest_file_name = f"{task_id}_manifest.json"
     
     # 確保 results 目錄存在
     results_dir = Path("results")
     results_dir.mkdir(exist_ok=True)
     
-    image_path = results_dir / image_file_name
-    gds_path = results_dir / gds_file_name
+    zip_path = results_dir / zip_file_name
+    manifest_path = results_dir / manifest_file_name
     
     max_retries = 30  # 最多等待30次 (每次10秒)
     retry_interval = 10  # 每10秒檢查一次
@@ -112,32 +124,33 @@ def wait_for_server_b_response(client_id: str) -> Tuple[str, str]:
         for attempt in range(max_retries):
             print(f"檢查 Server B 結果... (嘗試 {attempt + 1}/{max_retries})")
             
-            ftp = CustomFTP_TLS()
-            ftp.connect(FTP_SERVER_B['host'], FTP_SERVER_B['port'])
-            ftp.auth() # 進行安全握手
-            ftp.login(FTP_SERVER_B['username'], FTP_SERVER_B['password'])
-            ftp.prot_p() #  將資料傳輸通道也加密
-            ftp.set_pasv(True)  # 使用被動模式
-            ftp.cwd(FTP_SERVER_B['download_dir'])
-            
-            # 列出可用檔案
-            files = ftp.nlst()
-            
-            # 檢查所需的檔案是否存在
-            if image_file_name in files and gds_file_name in files:
-                print("找到結果檔案，開始下載...")
+            with CustomFTP_TLS() as ftp:
+                ftp.connect(FTP_SERVER_B['host'], FTP_SERVER_B['port'])
+                ftp.auth() # 進行安全握手
+                ftp.login(FTP_SERVER_B['username'], FTP_SERVER_B['password'])
+                ftp.prot_p() #  將資料傳輸通道也加密
+                ftp.set_pasv(True)  # 使用被動模式
+                ftp.cwd(FTP_SERVER_B['download_dir'])
                 
-                # 下載 PNG 檔案
-                with open(image_path, 'wb') as f:
-                    ftp.retrbinary(f'RETR {image_file_name}', f.write)
+                # 列出可用檔案
+                files = ftp.nlst()
                 
-                # 下載 GDS 檔案
-                with open(gds_path, 'wb') as f:
-                    ftp.retrbinary(f'RETR {gds_file_name}', f.write)
-                
-                ftp.quit()
-                print(f"已從 Server B 下載檔案: {image_file_name}, {gds_file_name}")
-                return image_file_name, gds_file_name
+                # 檢查所需的檔案是否存在 (ZIP + manifest)
+                if zip_file_name in files and manifest_file_name in files:
+                    print("找到批次結果檔案，開始下載...")
+                    
+                    # 下載 manifest 檔案
+                    with open(manifest_path, 'wb') as f:
+                        ftp.retrbinary(f'RETR {manifest_file_name}', f.write)
+                    
+                    # 下載 ZIP 檔案
+                    with open(zip_path, 'wb') as f:
+                        ftp.retrbinary(f'RETR {zip_file_name}', f.write)
+                    
+                    print(f"已從 Server B 下載批次檔案: {zip_file_name}, {manifest_file_name}")
+                    
+                    # 解析 manifest 並解壓縮檔案
+                    return extract_and_process_batch_results(task_id, zip_path, manifest_path)
             
             # 如果檔案還沒準備好，等待後重試
             time.sleep(retry_interval)
@@ -149,10 +162,66 @@ def wait_for_server_b_response(client_id: str) -> Tuple[str, str]:
         print(f"從 Server B 下載檔案失敗: {e}")
         raise
 
-@celery_app.task
-def run_ai_processing_task(client_id: str, file_paths: list, rule_text: str):
+def extract_and_process_batch_results(task_id: str, zip_path: Path, manifest_path: Path) -> Dict:
+    """解壓縮並處理批次結果檔案"""
+    try:
+        # 讀取 manifest
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            manifest = json.load(f)
+        
+        # 建立任務專用目錄
+        task_results_dir = Path("results") / task_id
+        task_results_dir.mkdir(exist_ok=True)
+        
+        # 解壓縮 ZIP 檔案到任務目錄
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(task_results_dir)
+        
+        # 準備回傳結果
+        extracted_files = []
+        png_files = []
+        gds_files = []
+        
+        for file_info in manifest.get('files', []):
+            file_path = task_results_dir / file_info['filename']
+            if file_path.exists():
+                extracted_files.append({
+                    'filename': file_info['filename'],
+                    'type': file_info['type'],
+                    'description': file_info.get('description', ''),
+                    'url': f"/results/{task_id}/{file_info['filename']}"
+                })
+                
+                # 分類檔案
+                if file_info['type'] == 'png':
+                    png_files.append(file_info['filename'])
+                elif file_info['type'] == 'gds':
+                    gds_files.append(file_info['filename'])
+        
+        print(f"成功解壓縮 {len(extracted_files)} 個檔案到 {task_results_dir}")
+        
+        return {
+            'batch_id': task_id,
+            'total_count': len(extracted_files),
+            'files': extracted_files,
+            'png_files': png_files,
+            'gds_files': gds_files,
+            'zip_file': zip_path.name,
+            'manifest': manifest
+        }
+        
+    except Exception as e:
+        print(f"處理批次結果失敗: {e}")
+        raise
+
+@celery_app.task(bind=True)
+def run_ai_processing_task(self, client_id: str, file_paths: list, rule_text: str):
     """Celery 主任務，串聯整個處理流程"""
     try:
+        # 獲取當前任務的 task_id
+        task_id = self.request.id
+        print(f"開始處理任務 - Client ID: {client_id}, Task ID: {task_id}")
+        
         # [修改] 所有進度更新都改為透過 Redis 發布
         update_progress_via_redis(client_id, {"status": "processing", "message": "任務已開始，正在啟動 AI 模型..."})
         
@@ -160,9 +229,9 @@ def run_ai_processing_task(client_id: str, file_paths: list, rule_text: str):
         update_progress_via_redis(client_id, {"status": "processing", "message": "AI 模型處理完成，準備傳送到 Server B..."})
         
         ftp_to_server_b(model_output_path)
-        update_progress_via_redis(client_id, {"status": "processing", "message": "檔案已傳送到 Server B，正在等待回傳結果..."})
+        update_progress_via_redis(client_id, {"status": "processing", "message": "檔案已傳送到 Server B，正在等待回傳批次結果..."})
         
-        image_name, gds_name = wait_for_server_b_response(client_id)
+        batch_results = wait_for_server_b_response(task_id)  # 使用 task_id 而不是 client_id
         
         # 清理上傳的暫存檔案
         for path in file_paths:
@@ -170,9 +239,10 @@ def run_ai_processing_task(client_id: str, file_paths: list, rule_text: str):
 
         final_payload = {
             "status": "completed",
-            "message": "處理完成！",
-            "image_url": f"/results/{image_name}",
-            "gds_url": f"/download/{gds_name}"
+            "message": f"批次處理完成！共產生 {batch_results['total_count']} 個檔案",
+            "batch_results": batch_results,
+            "zip_url": f"/results/{batch_results['zip_file']}",
+            "files": batch_results['files']
         }
         update_progress_via_redis(client_id, final_payload)
 
