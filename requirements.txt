@@ -6,3 +6,5 @@ celery
 redis[hiredis]
 # Environment variables support
 python-dotenv
+# HTTP client for API communication
+requests

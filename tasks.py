@@ -4,8 +4,8 @@ import json
 import zipfile
 from pathlib import Path
 import redis
-import ftplib
-from typing import Tuple, Dict, List
+import requests
+from typing import Dict
 from dotenv import load_dotenv
 
 from celery_app import celery_app
@@ -17,39 +17,22 @@ load_dotenv()
 # 建立一個標準的 (同步) Redis 客戶端，專門用來發布訊息
 redis_client = redis.from_url("redis://localhost:6379")
 
-# --- FTP Configuration for Server B ---
-FTP_SERVER_B = {
-    'host': os.getenv('FTP_SERVER_B_HOST', 'your-server-b-hostname'),
-    'port': int(os.getenv('FTP_SERVER_B_PORT', '21')),
-    'username': os.getenv('FTP_SERVER_B_USER', 'your-username'),
-    'password': os.getenv('FTP_SERVER_B_PASS', 'your-password'),
-    'upload_dir': os.getenv('FTP_SERVER_B_UPLOAD_DIR', '/upload'),
-    'download_dir': os.getenv('FTP_SERVER_B_DOWNLOAD_DIR', '/results')
+# --- API Configuration for Server B ---
+API_SERVER_B = {
+    'base_url': os.getenv('API_SERVER_B_URL', 'http://your-server-b-hostname:8001'),
+    'upload_endpoint': os.getenv('API_SERVER_B_UPLOAD', '/api/v1/upload'),
+    'status_endpoint': os.getenv('API_SERVER_B_STATUS', '/api/v1/status'),
+    'download_endpoint': os.getenv('API_SERVER_B_DOWNLOAD', '/api/v1/download'),
+    'api_key': os.getenv('API_SERVER_B_KEY', 'your-api-key'),
+    'timeout': int(os.getenv('API_TIMEOUT', '30'))
 }
 
-class CustomFTP_TLS(ftplib.FTP_TLS):
-    """Custom FTP_TLS class to handle TLS session reuse issues"""
-    
-    def ntransfercmd(self, cmd, rest=None):
-        conn, size = ftplib.FTP.ntransfercmd(self, cmd, rest)
-        if self._prot_p:
-            conn = self.context.wrap_socket(conn,
-                                          server_hostname=self.host,
-                                          session=self.sock.session)  # Reuse TLS session
-        return conn, size
-    
-    def __enter__(self):
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            self.quit()
-        except:
-            # If quit fails, try close as fallback
-            try:
-                self.close()
-            except:
-                pass
+def get_api_headers() -> Dict[str, str]:
+    """Get API headers with authentication"""
+    return {
+        'Authorization': f'Bearer {API_SERVER_B["api_key"]}',
+        'Content-Type': 'application/json'
+    }
 
 def update_progress_via_redis(client_id: str, payload: dict):
     """
@@ -78,44 +61,54 @@ def mock_ai_model(file_paths: list, rule_text: str):
     print("AI 模型處理完成。")
     return output_path
 
-def ftp_to_server_b(model_output_path: str):
-    """將結果 FTP 到 Server B"""
+def upload_to_server_b(model_output_path: str, task_id: str) -> Dict:
+    """將結果透過 API 上傳到 Server B"""
     try:
-        print(f"正在將 {model_output_path} FTP 到 Server B...")
+        print(f"正在將 {model_output_path} 透過 API 上傳到 Server B...")
         
-        with CustomFTP_TLS() as ftp:
-            ftp.connect(FTP_SERVER_B['host'], FTP_SERVER_B['port'])
-            ftp.auth() # 進行安全握手
-            ftp.login(FTP_SERVER_B['username'], FTP_SERVER_B['password'])
-            ftp.prot_p()  # 將資料傳輸通道也加密
-            ftp.set_pasv(True)  # 使用被動模式
-            
-            # 切換到上傳目錄
-            ftp.cwd(FTP_SERVER_B['upload_dir'])
-            
-            # 上傳檔案
-            with open(model_output_path, 'rb') as file:
-                filename = Path(model_output_path).name
-                ftp.storbinary(f'STOR {filename}', file)
-        print("FTP 傳輸完成。")
+        upload_url = f"{API_SERVER_B['base_url']}{API_SERVER_B['upload_endpoint']}"
         
+        # 準備上傳的檔案和資料
+        with open(model_output_path, 'rb') as file:
+            files = {
+                'file': (Path(model_output_path).name, file, 'application/octet-stream')
+            }
+            data = {
+                'task_id': task_id,
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+            }
+            headers = {
+                'Authorization': f'Bearer {API_SERVER_B["api_key"]}'
+            }
+            
+            response = requests.post(
+                upload_url,
+                files=files,
+                data=data,
+                headers=headers,
+                timeout=API_SERVER_B['timeout']
+            )
+            
+            response.raise_for_status()
+            result = response.json()
+            
+        print(f"API 上傳完成。回應: {result}")
+        return result
+        
+    except requests.exceptions.RequestException as e:
+        print(f"API 上傳失敗: {e}")
+        raise
     except Exception as e:
-        print(f"FTP 上傳失敗: {e}")
+        print(f"上傳過程發生錯誤: {e}")
         raise
 
 def wait_for_server_b_response(task_id: str) -> Dict:
     """等待並下載 Server B 回傳批次結果"""
     print(f"等待 Server B 回傳批次結果... (Task ID: {task_id})")
     
-    zip_file_name = f"{task_id}_results.zip"
-    manifest_file_name = f"{task_id}_manifest.json"
-    
     # 確保 results 目錄存在
     results_dir = Path("results")
     results_dir.mkdir(exist_ok=True)
-    
-    zip_path = results_dir / zip_file_name
-    manifest_path = results_dir / manifest_file_name
     
     max_retries = 30  # 最多等待30次 (每次10秒)
     retry_interval = 10  # 每10秒檢查一次
@@ -124,42 +117,128 @@ def wait_for_server_b_response(task_id: str) -> Dict:
         for attempt in range(max_retries):
             print(f"檢查 Server B 結果... (嘗試 {attempt + 1}/{max_retries})")
             
-            with CustomFTP_TLS() as ftp:
-                ftp.connect(FTP_SERVER_B['host'], FTP_SERVER_B['port'])
-                ftp.auth() # 進行安全握手
-                ftp.login(FTP_SERVER_B['username'], FTP_SERVER_B['password'])
-                ftp.prot_p() #  將資料傳輸通道也加密
-                ftp.set_pasv(True)  # 使用被動模式
-                ftp.cwd(FTP_SERVER_B['download_dir'])
-                
-                # 列出可用檔案
-                files = ftp.nlst()
-                
-                # 檢查所需的檔案是否存在 (ZIP + manifest)
-                if zip_file_name in files and manifest_file_name in files:
-                    print("找到批次結果檔案，開始下載...")
-                    
-                    # 下載 manifest 檔案
-                    with open(manifest_path, 'wb') as f:
-                        ftp.retrbinary(f'RETR {manifest_file_name}', f.write)
-                    
-                    # 下載 ZIP 檔案
-                    with open(zip_path, 'wb') as f:
-                        ftp.retrbinary(f'RETR {zip_file_name}', f.write)
-                    
-                    print(f"已從 Server B 下載批次檔案: {zip_file_name}, {manifest_file_name}")
-                    
-                    # 解析 manifest 並解壓縮檔案
-                    return extract_and_process_batch_results(task_id, zip_path, manifest_path)
+            # 檢查任務狀態
+            status_url = f"{API_SERVER_B['base_url']}{API_SERVER_B['status_endpoint']}/{task_id}"
+            headers = get_api_headers()
             
-            # 如果檔案還沒準備好，等待後重試
+            response = requests.get(status_url, headers=headers, timeout=API_SERVER_B['timeout'])
+            response.raise_for_status()
+            status_data = response.json()
+            
+            print(f"任務狀態: {status_data.get('status', 'unknown')}")
+            
+            # 如果任務完成，下載結果
+            if status_data.get('status') == 'completed':
+                print("任務完成，開始下載結果...")
+                return download_results_from_server_b(task_id, status_data)
+            
+            # 如果任務失敗
+            elif status_data.get('status') == 'failed':
+                error_msg = status_data.get('error', '未知錯誤')
+                raise Exception(f"Server B 處理失敗: {error_msg}")
+            
+            # 如果還在處理中，等待後重試
             time.sleep(retry_interval)
         
-        # 如果超過重試次數仍未找到檔案
-        raise TimeoutError(f"等待 Server B 回傳結果超時 ({max_retries * retry_interval} 秒)")
+        # 如果超過重試次數仍未完成
+        raise TimeoutError(f"等待 Server B 完成處理超時 ({max_retries * retry_interval} 秒)")
+        
+    except requests.exceptions.RequestException as e:
+        print(f"API 請求失敗: {e}")
+        raise
+    except Exception as e:
+        print(f"等待 Server B 回應失敗: {e}")
+        raise
+
+def download_results_from_server_b(task_id: str, status_data: Dict) -> Dict:
+    """從 Server B 下載處理結果"""
+    try:
+        download_url = f"{API_SERVER_B['base_url']}{API_SERVER_B['download_endpoint']}/{task_id}"
+        headers = get_api_headers()
+        
+        # 下載 ZIP 檔案
+        response = requests.get(download_url, headers=headers, timeout=API_SERVER_B['timeout'], stream=True)
+        response.raise_for_status()
+        
+        # 儲存下載的檔案
+        results_dir = Path("results")
+        zip_file_name = f"{task_id}_results.zip"
+        zip_path = results_dir / zip_file_name
+        
+        with open(zip_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        print(f"已從 Server B 下載結果檔案: {zip_file_name}")
+        
+        # 如果 status_data 包含 manifest 資訊，直接使用
+        if 'manifest' in status_data:
+            manifest_data = status_data['manifest']
+            # 創建臨時 manifest 檔案
+            manifest_path = results_dir / f"{task_id}_manifest.json"
+            with open(manifest_path, 'w', encoding='utf-8') as f:
+                json.dump(manifest_data, f, ensure_ascii=False, indent=2)
+            
+            return extract_and_process_batch_results(task_id, zip_path, manifest_path)
+        else:
+            # 否則解壓縮後自動偵測檔案
+            return extract_and_process_batch_results_auto(task_id, zip_path)
+            
+    except requests.exceptions.RequestException as e:
+        print(f"下載結果失敗: {e}")
+        raise
+    except Exception as e:
+        print(f"處理下載結果失敗: {e}")
+        raise
+
+def extract_and_process_batch_results_auto(task_id: str, zip_path: Path) -> Dict:
+    """自動偵測並處理批次結果檔案"""
+    try:
+        # 建立任務專用目錄
+        task_results_dir = Path("results") / task_id
+        task_results_dir.mkdir(exist_ok=True)
+        
+        # 解壓縮 ZIP 檔案到任務目錄
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(task_results_dir)
+        
+        # 自動偵測檔案類型
+        extracted_files = []
+        png_files = []
+        gds_files = []
+        
+        for file_path in task_results_dir.iterdir():
+            if file_path.is_file():
+                filename = file_path.name
+                file_type = filename.split('.')[-1].lower() if '.' in filename else 'unknown'
+                
+                extracted_files.append({
+                    'filename': filename,
+                    'type': file_type,
+                    'description': f'{file_type.upper()} 檔案',
+                    'url': f"/results/{task_id}/{filename}"
+                })
+                
+                # 分類檔案
+                if file_type == 'png':
+                    png_files.append(filename)
+                elif file_type == 'gds':
+                    gds_files.append(filename)
+        
+        print(f"成功自動偵測並解壓縮 {len(extracted_files)} 個檔案到 {task_results_dir}")
+        
+        return {
+            'batch_id': task_id,
+            'total_count': len(extracted_files),
+            'files': extracted_files,
+            'png_files': png_files,
+            'gds_files': gds_files,
+            'zip_file': zip_path.name,
+            'manifest': {'files': extracted_files}
+        }
         
     except Exception as e:
-        print(f"從 Server B 下載檔案失敗: {e}")
+        print(f"自動處理批次結果失敗: {e}")
         raise
 
 def extract_and_process_batch_results(task_id: str, zip_path: Path, manifest_path: Path) -> Dict:
@@ -228,7 +307,7 @@ def run_ai_processing_task(self, client_id: str, file_paths: list, rule_text: st
         model_output_path = mock_ai_model(file_paths, rule_text)
         update_progress_via_redis(client_id, {"status": "processing", "message": "AI 模型處理完成，準備傳送到 Server B..."})
         
-        ftp_to_server_b(model_output_path)
+        upload_to_server_b(model_output_path, task_id)
         update_progress_via_redis(client_id, {"status": "processing", "message": "檔案已傳送到 Server B，正在等待回傳批次結果..."})
         
         batch_results = wait_for_server_b_response(task_id)  # 使用 task_id 而不是 client_id
